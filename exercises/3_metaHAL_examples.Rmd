@@ -1,0 +1,346 @@
+---
+title: "Meta-HAL Examples"
+author: 
+  - Zeyi Wang
+  - Wenxin Zhang
+  - Brian Caffo
+  - Martin Lindquist
+  - Mark van der Laan
+output: html_document
+date: "2024-05-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Simple DGP
+
+
+```{r data, message=FALSE}
+library(dplyr)
+library(sl3)
+library(R6)
+library(Matrix)
+source("./20240410_metaHAL_examples_functions.R")
+
+sample_size <- 2000
+p_cov <- 4
+p_image <- 4
+ratio_nonzero <- 0.5
+truth <- trt_coef <- 1
+
+coef_A <- 0.2
+int_A <- - round(p_image * ratio_nonzero) * coef_A * 0.5
+coef_Y <- 0.6
+
+set.seed(123)
+data <- generate_data(sample_size, p_cov, p_image, ratio_nonzero, trt_coef, coef_A, int_A, coef_Y)
+head(data)
+
+```
+
+```{r metaHAL}
+###
+# create a meta-learning problem 
+# the first p_cov columns are kept (by degenerate base learners)
+# the whole W is transformed
+###
+
+# base learners that are identity links of the first p_cov covariates and the treatment
+base_lrnrs <- lapply(1:p_cov, function(i) {
+  make_learner(Pipeline, Lrnr_screener_name$new(var_name = paste0("X", i)), Lrnr_identity$new())  
+})
+names(base_lrnrs)[1:p_cov] <- paste0("lrnr_", 1:p_cov)
+base_lrnrs[["lrnr_trt"]] <- make_learner(Pipeline, Lrnr_screener_name$new(var_name = "trt"), Lrnr_identity$new())    
+
+# base learners that predict E[Y | A = 1, W] and E[Y | A = 0, W]; transform (p_cov + p_image)-dimensional W into a 2-dimensional summary
+temp_vec <- rep(1, ncol(data) - 1)
+temp_vec[grep("^X", colnames(data[, -ncol(data)]))] <- 0
+temp_vec[grep("^trt", colnames(data[, -ncol(data)]))] <- 0
+base_lrnrs[["lrnr_Q_1"]] <- Lrnr_glmnet_overfit_sparse_insert$new(trt_name = "trt", trt_value = 1, penalty.factor = temp_vec)
+base_lrnrs[["lrnr_Q_0"]] <- Lrnr_glmnet_overfit_sparse_insert$new(trt_name = "trt", trt_value = 0, penalty.factor = temp_vec)
+
+# ready to fit meta-level HAL models using the base learner outputs as second-level predictors
+lrnr_hal <- Lrnr_hal9001$new(max_degree = 2, smoothness_orders = 1)  # the meta-level HAL
+meta_hal = sl3::Lrnr_sl$new(learners = base_lrnrs, metalearner = lrnr_hal)  # the metaHAL SL
+
+# set up cross-validation
+set.seed(123)
+folds_backup <- origami::make_folds(data, 
+                                    fold_fun = origami::folds_vfold,
+                                    V = 10)
+
+# set up metaHAL SL
+node_list <- list(
+  W = names(data) %>% head(-2),
+  A = "trt",
+  Y = "Y"
+)
+task = sl3::make_sl3_Task(data,
+                          covariates = c(node_list$W, node_list$A), 
+                          folds = folds_backup,
+                          outcome = "Y",
+                          outcome_type = "continuous")
+meta_hal_fit <- meta_hal$train(task)
+
+# check out the meta-level data
+head(meta_hal_fit$fit_object$cv_meta_task$data)
+
+# plug-in estimation with metaHAL
+data1 <- data
+data1$trt <- 1
+task1 = sl3::make_sl3_Task(data = data1,
+                           covariates = c(node_list$W, node_list$A),
+                           folds = folds_backup,
+                           outcome = "Y",
+                           outcome_type = "continuous")
+
+data0 <- data
+data0$trt <- 0
+task0 = sl3::make_sl3_Task(data = data0,
+                           covariates = c(node_list$W, node_list$A),
+                           folds = folds_backup,
+                           outcome = "Y",
+                           outcome_type = "continuous")
+
+
+mean(meta_hal_fit$predict(task1) - meta_hal_fit$predict(task0))
+```
+
+
+
+```{r honest}
+# 1. Get candidate lambdas
+lambda_star_fast <- meta_hal_fit$metalearner_fit()$lambda_star
+metalearner_fit <- meta_hal_fit$metalearner_fit()$lasso_fit$glmnet.fit
+lambda_list <- metalearner_fit$lambda
+
+# 2. Pass HAL Params & Generate a meta-HAL for every lambda
+params_honestCV <- meta_hal_fit$params[["metalearner"]]$params
+
+# metalrnr_hal_candidates <- Lrnr_hal9001$new(
+#   max_degree = params_honestCV$max_degree,
+#   return_lasso = FALSE,
+#   lambda = lambda_list,
+#   fit_control = list(type.measure = "mse",
+#                      cv_select = FALSE))
+# 
+# # 3. Try Honest MetaHAL by discrete SL. It works but slow.
+# set.seed(2) # Control CV in internal folds
+# meta_hal_candidates_sl <- Lrnr_sl$new(base_lrnrs, metalearner = metalrnr_hal_candidates)
+# meta_hal_candidates_cv <- make_learner(Lrnr_cv,
+#                                        meta_hal_candidates_sl,
+#                                        full_fit=TRUE)
+# start_time <- proc.time() # start time
+# set.seed(2)
+# meta_hal_candidates_cv_fit <- meta_hal_candidates_cv$train(task)
+# 
+# runtime_sl_fit <- proc.time() - start_time # end time - start time = run time
+# print(runtime_sl_fit)
+# 
+# # 4. Find and use lambda_honest to contruct meta_hal_honest_cv
+# meta_hal_candidates_cv_pred <- meta_hal_candidates_cv_fit$predict_fold(task, fold_number = "validation")
+# lambda_cv_risks <- meta_hal_candidates_cv_fit$cv_risk(eval_fun = loss_squared_error)
+# lambda_honest <- lambda_list[which.min(lambda_cv_risks$MSE)]
+
+lambda_honest <- 0.005411599
+lambda_star_fast  # compared to the fast selector
+
+metalrnr_hal_honest <- Lrnr_hal9001$new(
+  max_degree = params_honestCV$max_degree,
+  return_lasso = FALSE,
+  lambda = lambda_honest, 
+  fit_control = list(type.measure = "mse",
+                     cv_select = FALSE))
+meta_hal_honest_cv <- Lrnr_sl$new(learners = base_lrnrs, 
+                                  metalearner = metalrnr_hal_honest)
+set.seed(2)
+meta_hal_honest_cv_fit <- meta_hal_honest_cv$train(task)
+
+# plug-in estimation with metaHAL (honest cv selector)
+mean(meta_hal_honest_cv_fit$predict(task1) - meta_hal_honest_cv_fit$predict(task0))  
+```
+
+
+
+## More additional covariates
+
+
+```{r}
+
+sample_size <- 2000
+p_cov <- 4
+# p_image <- 4
+# ratio_nonzero <- 0.5
+
+p_image <- 40
+ratio_nonzero <- 1
+
+truth <- trt_coef <- 1
+
+coef_A <- 0.2
+int_A <- - round(p_image * ratio_nonzero) * coef_A * 0.5
+coef_Y <- 0.6
+
+# dimension of W: p_cov + p_image
+# active dimension of W: p_cov + p_image * ratio_nonzero
+# binary W, A; continuous Y
+set.seed(123)
+data <- generate_data(sample_size, p_cov, p_image, ratio_nonzero, trt_coef, coef_A, int_A, coef_Y)
+head(data)
+
+```
+
+
+```{r}
+# base learners that are identity links of the first p_cov covariates and the treatment
+base_lrnrs <- lapply(1:p_cov, function(i) {
+  make_learner(Pipeline, Lrnr_screener_name$new(var_name = paste0("X", i)), Lrnr_identity$new())  
+})
+names(base_lrnrs)[1:p_cov] <- paste0("lrnr_", 1:p_cov)
+base_lrnrs[["lrnr_trt"]] <- make_learner(Pipeline, Lrnr_screener_name$new(var_name = "trt"), Lrnr_identity$new())    
+
+# base learners that predict E[Y | A = 1, W] and E[Y | A = 0, W]; transform (p_cov + p_image)-dimensional W into a 2-dimensional summary
+temp_vec <- rep(1, ncol(data) - 1)
+temp_vec[grep("^X", colnames(data[, -ncol(data)]))] <- 0
+temp_vec[grep("^trt", colnames(data[, -ncol(data)]))] <- 0
+base_lrnrs[["lrnr_Q_1"]] <- Lrnr_glmnet_overfit_sparse_insert$new(trt_name = "trt", trt_value = 1, penalty.factor = temp_vec)
+base_lrnrs[["lrnr_Q_0"]] <- Lrnr_glmnet_overfit_sparse_insert$new(trt_name = "trt", trt_value = 0, penalty.factor = temp_vec)
+# ready to fit meta-level HAL models using the base learner outputs as second-level predictors
+lrnr_hal <- Lrnr_hal9001$new(max_degree = 2, smoothness_orders = 1)  # the meta-level HAL
+meta_hal = sl3::Lrnr_sl$new(learners = base_lrnrs, metalearner = lrnr_hal)  # the metaHAL SL
+
+# set up cross-validation
+set.seed(123)
+folds_backup <- origami::make_folds(data, 
+                                    fold_fun = origami::folds_vfold,
+                                    V = 10)
+
+# set up metaHAL SL
+node_list <- list(
+  W = names(data) %>% head(-2),
+  A = "trt",
+  Y = "Y"
+)
+task = sl3::make_sl3_Task(data,
+                          covariates = c(node_list$W, node_list$A), 
+                          folds = folds_backup,
+                          outcome = "Y",
+                          outcome_type = "continuous")
+
+meta_hal_fit <- meta_hal$train(task)
+
+# check out the meta-level data
+head(meta_hal_fit$fit_object$cv_meta_task$data)
+
+# plug-in estimation with metaHAL
+data1 <- data
+data1$trt <- 1
+task1 = sl3::make_sl3_Task(data = data1,
+                           covariates = c(node_list$W, node_list$A),
+                           folds = folds_backup,
+                           outcome = "Y",
+                           outcome_type = "continuous")
+
+data0 <- data
+data0$trt <- 0
+task0 = sl3::make_sl3_Task(data = data0,
+                           covariates = c(node_list$W, node_list$A),
+                           folds = folds_backup,
+                           outcome = "Y",
+                           outcome_type = "continuous")
+
+
+mean(meta_hal_fit$predict(task1) - meta_hal_fit$predict(task0))
+```
+
+
+```{r}
+# utilizing information in g
+base_lrnrs_g <- base_lrnrs
+temp_vec_g <- rep(1, ncol(data) - 2)
+temp_vec_g[grep("^X", colnames(data[, -ncol(data)]))] <- 0
+base_lrnrs_g[["lrnr_G"]] <- Lrnr_glmnet_overfit_sparse_G$new(force_DV = "trt", penalty.factor = temp_vec_g)
+meta_hal_g = sl3::Lrnr_sl$new(learners = base_lrnrs_g, metalearner = lrnr_hal)  # the metaHAL SL with g
+meta_hal_fit_g <- meta_hal_g$train(task)
+
+
+# check out the meta-level data with an additional column
+head(meta_hal_fit_g$fit_object$cv_meta_task$data)
+
+# similar performance with correct Q and g
+mean(meta_hal_fit_g$predict(task1) - meta_hal_fit_g$predict(task0))
+
+
+
+
+
+# undersmoothing by selecting a smaller lambda
+
+lambda_list <- meta_hal_fit_g$metalearner_fit()$lasso_fit$glmnet.fit$lambda
+lambda_list <- c(lambda_list, last(lambda_list)/2^(1:20) )
+lambda_star <- meta_hal_fit_g$metalearner_fit()$lambda_star
+init_step <- current_step <- which(lambda_list == lambda_star)
+
+
+meta_hal_fit_undersmoothed <- meta_hal_fit_g
+current_lambda <- lambda_star
+vec_eq <- c()
+vec_threshold <- c()
+IC <- data$trt / meta_hal_fit_g$learner_fits$lrnr_G$predict(task1) * (data$Y - meta_hal_fit_undersmoothed$predict(task1)) - 
+  (1 - data$trt) / (1 - meta_hal_fit_g$learner_fits$lrnr_G$predict(task1)) * (data$Y - meta_hal_fit_undersmoothed$predict(task0))
+n <- nrow(data)
+se_Dstar <- sqrt(var(IC) / n)
+ED_threshold <- se_Dstar / min(log(n), 10)
+ED_init <- ED_update <- mean(IC)
+vec_eq[current_step] <- abs(mean(IC))
+if_init_solved <- abs(ED_init) < ED_threshold
+
+if (!if_init_solved) {
+  while(current_step < min(length(lambda_list), init_step + 20) ) {
+    ED_pre <- ED_update
+    current_step <- current_step + 1
+    current_lambda <- lambda_list[current_step]
+    lrnr_hal_undersmoothed = Lrnr_hal9001$new(max_degree = 2, smoothness_orders = 1, lambda = current_lambda, fit_control = list(cv_select = F))
+    meta_hal_undersmoothed = sl3::Lrnr_sl$new(learners = base_lrnrs_g, metalearner = lrnr_hal_undersmoothed)
+    meta_hal_fit_undersmoothed <- meta_hal_undersmoothed$train(task)
+    
+    IC <- data$trt / meta_hal_fit_g$learner_fits$lrnr_G$predict(task1) * (data$Y - meta_hal_fit_undersmoothed$predict(task1)) - 
+      (1 - data$trt) / (1 - meta_hal_fit_g$learner_fits$lrnr_G$predict(task1)) * (data$Y - meta_hal_fit_undersmoothed$predict(task0))
+    n <- nrow(data)
+    se_Dstar <- sqrt(var(IC) / n)
+    ED_threshold <- se_Dstar / min(log(n), 10)
+    
+    vec_eq[current_step] <- abs(mean(IC))
+    vec_threshold[current_step] <- ED_threshold
+    
+    temp_est <- mean(meta_hal_fit_undersmoothed$predict(task1)) - mean(meta_hal_fit_undersmoothed$predict(task0))              
+    if (abs(mean(IC)) <= ED_threshold | abs(ED_pre) < abs(mean(IC)) ) {
+      # consider record this successful lambda
+      break()
+    } 
+  }
+}
+
+IC <- data$trt / meta_hal_fit_g$learner_fits$lrnr_G$predict(task1) * (data$Y - meta_hal_fit_undersmoothed$predict(task1)) - 
+  (1 - data$trt) / (1 - meta_hal_fit_g$learner_fits$lrnr_G$predict(task1)) * (data$Y - meta_hal_fit_undersmoothed$predict(task0))
+n <- nrow(data)
+se_Dstar <- sqrt(var(IC) / n)
+var_est_update <- se_Dstar^2  # track
+ED_update <- mean(IC)
+ED_threshold <- se_Dstar / min(log(n), 10)
+if_update_solved <- abs(ED_update) < ED_threshold
+update_est <- mean(meta_hal_fit_undersmoothed$predict(task1)) - mean(meta_hal_fit_undersmoothed$predict(task0))
+
+update_est
+ED_init
+ED_update
+
+c(
+  Estimate = update_est, 
+  Lower = update_est - 1.96 * se_Dstar, 
+  Upper = update_est + 1.96 * se_Dstar
+)
+
+```
